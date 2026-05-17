@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  # 1. Cassandra: Για τα δεδομένα των αισθητήρων (Time-series)
+  cassandra:
+    image: cassandra:4.1
+    container_name: gridsense_cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=GridSenseCluster
+      - CASSANDRA_DC=dc1
+    networks:
+      - gridsense_net
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+
+  # 2. Neo4j: Για την τοπολογία του δικτύου (Graph)
+  neo4j:
+    image: neo4j:5.12
+    container_name: gridsense_neo4j
+    ports:
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+      - NEO4J_PLUGINS=["apoc"]
+    networks:
+      - gridsense_net
+    volumes:
+      - neo4j_data:/data
+
+  # 3. PostgreSQL: Για λογαριασμούς και χρέωση (Relational + JSONB)
+  postgres:
+    image: postgres:15
+    container_name: gridsense_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=gridsense_db
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=adminpass
+    networks:
+      - gridsense_net
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # 4. MongoDB: Για κατάλογο εξοπλισμού (Document)
+  mongodb:
+    image: mongo:7.0
+    container_name: gridsense_mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=rootpass
+    networks:
+      - gridsense_net
+    volumes:
+      - mongo_data:/data/db
+
+  # 5. Redis: Για caching και alerts (Key-Value)
+  redis:
+    image: redis:7.0
+    container_name: gridsense_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - gridsense_net
+    volumes:
+      - redis_data:/data
+
+networks:
+  gridsense_net:
+    driver: bridge
+
+volumes:
+  cassandra_data:
+  neo4j_data:
+  postgres_data:
+  mongo_data:
+  redis_data:
