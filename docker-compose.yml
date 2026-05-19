@@ -1,82 +1,160 @@
-version: '3.8'
-
 services:
-  # 1. Cassandra: Για τα δεδομένα των αισθητήρων (Time-series)
-  cassandra:
+
+  # ── 1. Apache Cassandra — time-series sensor readings ───────────────────────
+  timeseries-db:
     image: cassandra:4.1
     container_name: gridsense_cassandra
+    restart: unless-stopped
     ports:
       - "9042:9042"
     environment:
-      - CASSANDRA_CLUSTER_NAME=GridSenseCluster
-      - CASSANDRA_DC=dc1
-    networks:
-      - gridsense_net
+      CASSANDRA_CLUSTER_NAME: "GridSenseCluster"
+      CASSANDRA_DC: "dc1"
+      HEAP_NEWSIZE: "128M"
+      MAX_HEAP_SIZE: "512M"
     volumes:
       - cassandra_data:/var/lib/cassandra
-
-  # 2. Neo4j: Για την τοπολογία του δικτύου (Graph)
-  neo4j:
-    image: neo4j:5.12
-    container_name: gridsense_neo4j
-    ports:
-      - "7474:7474" # HTTP
-      - "7687:7687" # Bolt
-    environment:
-      - NEO4J_AUTH=neo4j/password123
-      - NEO4J_PLUGINS=["apoc"]
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN' && cqlsh -e 'SELECT now() FROM system.local;' > /dev/null 2>&1"]
+      interval: 30s
+      timeout: 15s
+      retries: 15
+      start_period: 90s
     networks:
       - gridsense_net
+
+  # ── 2. Neo4j — power network topology graph ─────────────────────────────────
+  graph-db:
+    image: neo4j:5-community
+    container_name: gridsense_neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # Browser UI
+      - "7687:7687"   # Bolt protocol
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: "512M"
     volumes:
       - neo4j_data:/data
-
-  # 3. PostgreSQL: Για λογαριασμούς και χρέωση (Relational + JSONB)
-  postgres:
-    image: postgres:15
-    container_name: gridsense_postgres
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=gridsense_db
-      - POSTGRES_USER=admin
-      - POSTGRES_PASSWORD=adminpass
+      - ./neo4j/import:/import
+    healthcheck:
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
     networks:
       - gridsense_net
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
 
-  # 4. MongoDB: Για κατάλογο εξοπλισμού (Document)
-  mongodb:
-    image: mongo:7.0
-    container_name: gridsense_mongodb
+  # ── 3. MongoDB — equipment metadata catalog ──────────────────────────────────
+  catalog-db:
+    image: mongo:7
+    container_name: gridsense_mongo
+    restart: unless-stopped
     ports:
       - "27017:27017"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=root
-      - MONGO_INITDB_ROOT_PASSWORD=rootpass
-    networks:
-      - gridsense_net
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_INITDB_ROOT_USERNAME}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
+      MONGO_INITDB_DATABASE: gridsense
     volumes:
       - mongo_data:/data/db
-
-  # 5. Redis: Για caching και alerts (Key-Value)
-  redis:
-    image: redis:7.0
-    container_name: gridsense_redis
-    ports:
-      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     networks:
       - gridsense_net
+
+  # ── 4. PostgreSQL — consumer billing & accounts (ACID) ───────────────────────
+  billing-db:
+    image: postgres:15-alpine
+    container_name: gridsense_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
     volumes:
-      - redis_data:/data
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    networks:
+      - gridsense_net
 
-networks:
-  gridsense_net:
-    driver: bridge
+  # ── 5. Redis — dashboard cache & fault alerts Pub/Sub ───────────────────────
+  cache:
+    image: redis:7-alpine
+    container_name: gridsense_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - gridsense_net
 
+  # ── 6. FastAPI — REST gateway ────────────────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: gridsense_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./scripts:/app/scripts
+    environment:
+      # Connection strings assembled from .env variables
+      CASSANDRA_HOST: timeseries-db
+      NEO4J_URI: bolt://graph-db:7687
+      MONGO_URI: "mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@catalog-db:27017"
+      POSTGRES_DSN: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@billing-db:5432/${POSTGRES_DB}"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@cache:6379/0"
+    depends_on:
+      timeseries-db:
+        condition: service_healthy
+      graph-db:
+        condition: service_healthy
+      catalog-db:
+        condition: service_healthy
+      billing-db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    networks:
+      - gridsense_net
+
+# ── Persistent volumes (data survives container restarts) ────────────────────
 volumes:
   cassandra_data:
   neo4j_data:
-  postgres_data:
   mongo_data:
-  redis_data:
+  pg_data:
+
+# ── Shared internal network ──────────────────────────────────────────────────
+networks:
+  gridsense_net:
+    name: gridsense_net
