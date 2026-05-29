@@ -11,4 +11,7 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Strip Windows line endings from the entrypoint script
+RUN sed -i 's/\r//' entrypoint.sh && chmod +x entrypoint.sh
+
+CMD ["bash", "./entrypoint.sh"]
