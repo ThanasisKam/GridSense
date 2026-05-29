@@ -79,7 +79,6 @@ curl -X POST http://localhost:8000/alerts/publish \
 curl "http://localhost:8000/alerts/active"
 ```
 
-Interactive API docs available at **http://localhost:8000/docs**
 
 ---
 
